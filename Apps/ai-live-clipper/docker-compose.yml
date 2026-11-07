@@ -1,0 +1,192 @@
+# AI LIVE CLIPPER PRO v1.1 — perfil de recursos para Lenovo i5 8.ª gen (4 núcleos / 8 hilos), 8 GB RAM.
+# Suma de límites de memoria ≈ 3,7 GB: el resto queda para Ubuntu, CasaOS, Docker y caché de disco.
+# Solo UNA tarea pesada (Whisper / render / compresión) corre a la vez (bloqueo global en Redis).
+name: ai-live-clipper
+
+x-env: &env
+  DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  REDIS_URL: redis://redis:6379/0
+  JWT_SECRET: ${JWT_SECRET}
+  FERNET_KEY: ${FERNET_KEY}
+  DATA_DIR: /data
+  MIN_FREE_GB: ${MIN_FREE_GB:-10}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+  TZ: ${TZ:-UTC}
+  MALLOC_ARENA_MAX: "2"          # menos fragmentación de memoria en Python
+  TELEGRAM_MAX_MB: ${TELEGRAM_MAX_MB:-49}
+  DOWNLOAD_LINK_HOURS: ${DOWNLOAD_LINK_HOURS:-24}
+
+# El disco externo se monta con propagación rslave: si se desconecta, el contenedor lo detecta
+# y NUNCA escribe en el SSD (el marcador .alc_mount_ok desaparece).
+x-data: &data
+  type: bind
+  source: ${EXTERNAL_MOUNT:?Define EXTERNAL_MOUNT en .env}
+  target: /data
+  bind:
+    propagation: rslave
+
+x-common: &common
+  restart: unless-stopped
+  init: true                     # recoge procesos hijos (ffmpeg, yt-dlp) y evita zombis
+  security_opt: ["no-new-privileges:true"]
+
+x-log: &log
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    <<: *common
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    command: >
+      postgres -c shared_buffers=96MB -c effective_cache_size=256MB -c work_mem=4MB -c maintenance_work_mem=32MB
+      -c max_connections=30 -c wal_buffers=4MB -c checkpoint_completion_target=0.9 -c random_page_cost=1.1
+      -c autovacuum_max_workers=2 -c log_min_duration_statement=2000
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      retries: 10
+    shm_size: 64m
+    mem_limit: 384m
+    memswap_limit: 384m
+    cpus: 1.0
+    logging: *log
+
+  redis:
+    image: redis:7-alpine
+    <<: *common
+    command: redis-server --maxmemory 64mb --maxmemory-policy noeviction --appendonly yes --appendfsync everysec --save "" --no-appendfsync-on-rewrite yes
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+    mem_limit: 96m
+    memswap_limit: 96m
+    cpus: 0.5
+    logging: *log
+
+  backend:
+    build: { context: /DATA/AppData/ai-live-clipper, dockerfile: docker/backend.Dockerfile }
+    <<: *common
+    environment:
+      <<: *env
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      TIKTOK_CLIENT_KEY: ${TIKTOK_CLIENT_KEY:-}
+      TIKTOK_CLIENT_SECRET: ${TIKTOK_CLIENT_SECRET:-}
+    volumes: [*data]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 20s
+      retries: 5
+    mem_limit: 384m
+    memswap_limit: 384m
+    cpus: 0.8
+    logging: *log
+
+  video-worker:
+    build: { context: /DATA/AppData/ai-live-clipper, dockerfile: docker/video.Dockerfile }
+    <<: *common
+    environment:
+      <<: *env
+      SEGMENT_SECONDS: ${SEGMENT_SECONDS:-300}
+      MAX_CAPTURES: ${MAX_CAPTURES:-1}
+    volumes: [*data]
+    depends_on:
+      backend: { condition: service_healthy }
+    mem_limit: 1280m
+    memswap_limit: 1280m          # sin swap dentro del contenedor: evita que el sistema se arrastre
+    cpus: 2.5                     # deja ~1,5 núcleos para Ubuntu, Postgres y la API
+    pids_limit: 256
+    stop_grace_period: 30s        # tiempo para cerrar FFmpeg y registrar el último segmento
+    logging: *log
+
+  ai-worker:
+    build: { context: /DATA/AppData/ai-live-clipper, dockerfile: docker/ai.Dockerfile }
+    <<: *common
+    environment:
+      <<: *env
+      WHISPER_MODEL: ${WHISPER_MODEL:-tiny}
+      WHISPER_THREADS: ${WHISPER_THREADS:-2}
+      WHISPER_IDLE_UNLOAD_SEC: ${WHISPER_IDLE_UNLOAD_SEC:-600}   # descarga el modelo si no hay trabajo (libera RAM)
+      OMP_NUM_THREADS: "2"
+    volumes:
+      - *data
+      - whisper_models:/models
+    depends_on:
+      backend: { condition: service_healthy }
+    mem_limit: 1100m
+    memswap_limit: 1100m
+    cpus: 2.5
+    pids_limit: 128
+    logging: *log
+
+  publisher:
+    build: { context: /DATA/AppData/ai-live-clipper, dockerfile: docker/publisher.Dockerfile }
+    <<: *common
+    environment:
+      <<: *env
+      POSTGRES_HOST: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      TIKTOK_CLIENT_KEY: ${TIKTOK_CLIENT_KEY:-}
+      TIKTOK_CLIENT_SECRET: ${TIKTOK_CLIENT_SECRET:-}
+      RECORDINGS_RETENTION_HOURS: ${RECORDINGS_RETENTION_HOURS:-48}
+    volumes: [*data]
+    depends_on:
+      backend: { condition: service_healthy }
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: 0.7
+    logging: *log
+
+  telegram-bot:
+    build: { context: /DATA/AppData/ai-live-clipper, dockerfile: docker/bot.Dockerfile }
+    <<: *common
+    environment:
+      <<: *env
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS:-}
+      TELEGRAM_COMPANY_ID: ${TELEGRAM_COMPANY_ID:-1}
+    volumes: [*data]
+    depends_on:
+      backend: { condition: service_healthy }
+    mem_limit: 160m
+    memswap_limit: 160m
+    cpus: 0.5
+    logging: *log
+
+  frontend:
+    build: { context: /DATA/AppData/ai-live-clipper, dockerfile: docker/frontend.Dockerfile }
+    <<: *common
+    mem_limit: 32m
+    cpus: 0.2
+    logging: *log
+
+  nginx:
+    image: nginx:1.27-alpine
+    <<: *common
+    ports: ["${HTTP_PORT:-8080}:80"]
+    volumes: ["/DATA/AppData/ai-live-clipper/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on: [backend, frontend]
+    mem_limit: 48m
+    cpus: 0.3
+    logging: *log
+
+volumes:
+  pgdata:
+  redisdata:
+  whisper_models:

@@ -1,0 +1,13 @@
+{
+  "name": "AI LIVE CLIPPER PRO",
+  "id": "ai-live-clipper",
+  "available": true,
+  "short_desc": "Captura y crea clips de transmisiones en vivo con ayuda de IA.",
+  "author": "AI LIVE CLIPPER PRO",
+  "port": 8080,
+  "categories": ["Media", "Utilities"],
+  "description": "Instalador CasaOS para AI LIVE CLIPPER PRO v1.1. Requiere que el código del proyecto esté disponible en /DATA/AppData/ai-live-clipper y que el disco externo esté montado. No modifica otras pilas de Docker.",
+  "developer": "AI LIVE CLIPPER PRO",
+  "website": "",
+  "main": true
+}
